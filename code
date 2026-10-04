@@ -1,0 +1,314 @@
+import os
+import joblib
+import numpy as np
+import pandas as pd
+from scipy import stats
+import matplotlib.pyplot as plt
+
+from sklearn.model_selection import train_test_split
+from sklearn.impute import SimpleImputer, KNNImputer
+from sklearn.preprocessing import StandardScaler, MinMaxScaler, RobustScaler, PowerTransformer, OneHotEncoder, OrdinalEncoder
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from imblearn.over_sampling import SMOTE
+
+# ==============================================================================
+# DATASET GENERATION (Classification, >3000 rows, mixed types, missing, imbalanced)
+# Domain: Loan Default Prediction (Credit Risk)
+# ==============================================================================
+np.random.seed(42)
+N = 4000
+
+# 1. Target with 85:15 imbalance (0: Repaid, 1: Default)
+target = np.random.choice([0, 1], size=N, p=[0.85, 0.15])
+
+# 2. Skewed numeric feature (Income) + normal numeric feature (Debt-to-Income)
+income = np.random.exponential(scale=45000, size=N) + 15000
+# Inject extreme outliers into income
+outlier_indices = np.random.choice(N, size=40, replace=False)
+income[outlier_indices] *= 4.5
+
+dti_ratio = np.random.normal(loc=28.0, scale=8.0, size=N)
+
+# 3. Categorical features
+# Low-cardinality nominal: home_ownership (Rent, Mortgage, Own)
+home_ownership = np.random.choice(["RENT", "MORTGAGE", "OWN"], size=N, p=[0.5, 0.4, 0.1])
+
+# Ordered ordinal: credit_grade (Poor, Fair, Good, Excellent)
+credit_grade = np.random.choice(["Poor", "Fair", "Good", "Excellent"], size=N, p=[0.2, 0.4, 0.3, 0.1])
+
+# High-cardinality nominal: zip_code (40 distinct regional codes)
+zip_codes = [f"ZIP_{i:02d}" for i in range(1, 41)]
+zip_code = np.random.choice(zip_codes, size=N)
+
+# 4. Inject missing values (~6% missing in income and dti_ratio)
+income[np.random.choice(N, size=240, replace=False)] = np.nan
+dti_ratio[np.random.choice(N, size=180, replace=False)] = np.nan
+
+df = pd.DataFrame({
+    "income": income,
+    "dti_ratio": dti_ratio,
+    "home_ownership": home_ownership,
+    "credit_grade": credit_grade,
+    "zip_code": zip_code,
+    "loan_default": target
+})
+df.to_csv("credit_risk_dataset.csv", index=False)
+print(f"Dataset generated with shape: {df.shape}")
+
+# ==============================================================================
+# 1. TRAIN-TEST SPLIT FIRST (STRATIFIED)
+# ==============================================================================
+X = df.drop(columns=["loan_default"])
+y = df["loan_default"]
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.20, stratify=y, random_state=42
+)
+
+print("\n--- 1. Stratified Split ---")
+print(f"Train set shape: {X_train.shape}, Test set shape: {X_test.shape}")
+print(f"Train class balance: {np.bincount(y_train) / len(y_train)}")
+print(f"Test class balance:  {np.bincount(y_test) / len(y_test)}")
+# Reasoning:
+# Splitting before any preprocessing isolates the test set as completely unseen data.
+# This prevents data leakage where test distributions (means, scales, vocabularies) inadvertently influence training decisions.
+
+# ==============================================================================
+# 2. THREE MISSING VALUE STRATEGIES (ON TRAIN ONLY)
+# ==============================================================================
+col_missing = "income"
+
+# Strategy A: Drop rows
+train_dropped = X_train[[col_missing]].dropna()
+mean_drop = train_dropped[col_missing].mean()
+std_drop = train_dropped[col_missing].std()
+
+# Strategy B: Median Imputation
+median_imp = SimpleImputer(strategy="median")
+train_median = median_imp.fit_transform(X_train[[col_missing]])
+mean_med = float(train_median.mean())
+std_med = float(train_median.std())
+
+# Strategy C: KNN Imputer (using both numeric columns)
+knn_imp = KNNImputer(n_neighbors=5)
+train_knn = knn_imp.fit_transform(X_train[["income", "dti_ratio"]])
+mean_knn = float(train_knn[:, 0].mean())
+std_knn = float(train_knn[:, 0].std())
+
+print("\n--- 2. Missing Value Comparison (Column: income) ---")
+print(f"Raw Drop:   Mean = {mean_drop:.2f}, Std = {std_drop:.2f} (Rows retained: {len(train_dropped)})")
+print(f"Median Imp: Mean = {mean_med:.2f}, Std = {std_med:.2f}")
+print(f"KNN Imp:    Mean = {mean_knn:.2f}, Std = {std_knn:.2f}")
+# Choice: Keep Median imputation because it is robust against extreme skew/outliers and computationally scalable.
+
+# ==============================================================================
+# 3. OUTLIER FLAGGING (IQR, Z-SCORE, PERCENTILE CAPPING)
+# ==============================================================================
+s = train_dropped[col_missing]
+
+# IQR rule
+q25, q75 = s.quantile(0.25), s.quantile(0.75)
+iqr = q75 - q25
+lower_iqr, upper_iqr = q25 - 1.5 * iqr, q75 + 1.5 * iqr
+iqr_mask = (s < lower_iqr) | (s > upper_iqr)
+
+# Z-score rule (> 3 standard deviations)
+z_scores = np.abs(stats.zscore(s))
+z_mask = z_scores > 3.0
+
+# 1st and 99th Percentile Capping
+p01, p99 = s.quantile(0.01), s.quantile(0.99)
+pct_mask = (s < p01) | (s > p99)
+
+overlap_iqr_z = (iqr_mask & z_mask).sum()
+overlap_iqr_pct = (iqr_mask & pct_mask).sum()
+
+print("\n--- 3. Outlier Flagging ---")
+print(f"IQR Flags:        {iqr_mask.sum()}")
+print(f"Z-Score Flags:    {z_mask.sum()}")
+print(f"Percentile Flags: {pct_mask.sum()}")
+print(f"Overlap (IQR & Z-score):    {overlap_iqr_z}")
+print(f"Overlap (IQR & Percentile): {overlap_iqr_pct}")
+# Choice: Percentile capping (winsorization) is chosen because it bounds extreme tails without dropping valid credit applications.
+
+# ==============================================================================
+# 4. THREE ENCODING STRATEGIES
+# ==============================================================================
+X_enc = X_train[["home_ownership", "credit_grade", "zip_code"]].copy()
+cols_step0 = X_enc.shape[1]
+
+# Low-cardinality nominal: One-Hot Encoding
+ohe = OneHotEncoder(sparse_output=False, handle_unknown="ignore")
+home_ohe = ohe.fit_transform(X_enc[["home_ownership"]])
+home_ohe_df = pd.DataFrame(home_ohe, columns=ohe.get_feature_names_out(["home_ownership"]))
+cols_step1 = cols_step0 - 1 + home_ohe_df.shape[1]
+
+# Ordered ordinal: Ordinal Encoding with explicit ordering
+grade_order = [["Poor", "Fair", "Good", "Excellent"]]
+ordinal = OrdinalEncoder(categories=grade_order)
+grade_ord = ordinal.fit_transform(X_enc[["credit_grade"]])
+cols_step2 = cols_step1  # Replaces single column with 1 encoded integer column
+
+# High-cardinality: Frequency Encoding (learned strictly on train)
+freq_map = X_train["zip_code"].value_counts(normalize=True).to_dict()
+zip_freq = X_train["zip_code"].map(freq_map).fillna(0.0)
+cols_step3 = cols_step2  # Replaces column with frequency score
+
+print("\n--- 4. Feature Encoding Columns ---")
+print(f"Initial categorical columns: {cols_step0}")
+print(f"After One-Hot Encoding:      {cols_step1}")
+print(f"After Ordinal Encoding:      {cols_step2}")
+print(f"After Frequency Encoding:    {cols_step3}")
+
+# ==============================================================================
+# 5. UNSEEN CATEGORY IN TEST (ZERO-CRASH HANDLING)
+# ==============================================================================
+unseen_encoder = OneHotEncoder(handle_unknown="ignore", sparse_output=False)
+unseen_encoder.fit(X_train[["home_ownership"]])
+
+# Synthetic test row containing unseen label "UNKNOWN_TENURE"
+unseen_test = pd.DataFrame({"home_ownership": ["UNKNOWN_TENURE", "RENT"]})
+transformed_unseen = unseen_encoder.transform(unseen_test)
+
+print("\n--- 5. Handling Unseen Categories ---")
+print("Transformed output with unseen category (all zeros in dummy positions):")
+print(transformed_unseen)
+
+# ==============================================================================
+# 6. FEATURE SCALING COMPARISON
+# ==============================================================================
+s_clean = s.values.reshape(-1, 1)
+
+std_scaled = StandardScaler().fit_transform(s_clean)
+minmax_scaled = MinMaxScaler().fit_transform(s_clean)
+robust_scaled = RobustScaler().fit_transform(s_clean)
+
+# Plot comparison (saved to disk for Colab / repository)
+fig, axes = plt.subplots(1, 4, figsize=(16, 3.5))
+axes[0].hist(s_clean, bins=30, color="gray")
+axes[0].set_title("Original (Skewed)")
+axes[1].hist(std_scaled, bins=30, color="blue")
+axes[1].set_title("StandardScaler")
+axes[2].hist(minmax_scaled, bins=30, color="green")
+axes[2].set_title("MinMaxScaler")
+axes[3].hist(robust_scaled, bins=30, color="purple")
+axes[3].set_title("RobustScaler")
+plt.tight_layout()
+plt.savefig("scaling_comparison.png")
+plt.close()
+
+print("\n--- 6. Scaling Comparison ---")
+print("Saved scaling_comparison.png successfully.")
+# RobustScaler handles outliers best because it scales via median and IQR rather than mean and variance.
+
+# ==============================================================================
+# 7. SKEWNESS REDUCTION (LOG1P & YEO-JOHNSON)
+# ==============================================================================
+orig_skew = stats.skew(s)
+log_transformed = np.log1p(np.maximum(0, s))
+log_skew = stats.skew(log_transformed)
+
+yj = PowerTransformer(method="yeo-johnson")
+yj_transformed = yj.fit_transform(s_clean).ravel()
+yj_skew = stats.skew(yj_transformed)
+
+print("\n--- 7. Skewness Transformation ---")
+print(f"Original Skewness:      {orig_skew:.4f}")
+print(f"After log1p:            {log_skew:.4f}")
+print(f"After Yeo-Johnson:      {yj_skew:.4f}")
+
+# ==============================================================================
+# 8. COLUMNTRANSFORMER INSIDE PRODUCTION PIPELINE
+# ==============================================================================
+numeric_features = ["income", "dti_ratio"]
+numeric_transformer = Pipeline([
+    ("imputer", SimpleImputer(strategy="median")),
+    ("scaler", RobustScaler())
+])
+
+ordinal_features = ["credit_grade"]
+ordinal_transformer = Pipeline([
+    ("imputer", SimpleImputer(strategy="most_frequent")),
+    ("encoder", OrdinalEncoder(categories=grade_order))
+])
+
+nominal_features = ["home_ownership"]
+nominal_transformer = Pipeline([
+    ("imputer", SimpleImputer(strategy="most_frequent")),
+    ("encoder", OneHotEncoder(handle_unknown="ignore", sparse_output=False))
+])
+
+preprocessor = ColumnTransformer(
+    transformers=[
+        ("num", numeric_transformer, numeric_features),
+        ("ord", ordinal_transformer, ordinal_features),
+        ("nom", nominal_transformer, nominal_features),
+    ],
+    remainder="drop"
+)
+
+pipeline = Pipeline([("preprocessor", preprocessor)])
+
+# Fit on train only, transform both
+X_train_proc = pipeline.fit_transform(X_train)
+X_test_proc = pipeline.transform(X_test)
+
+print("\n--- 8. Pipeline Output Shapes ---")
+print(f"Train processed shape: {X_train_proc.shape}")
+print(f"Test processed shape:  {X_test_proc.shape}")
+assert X_train_proc.shape[1] == X_test_proc.shape[1], "Column counts do not match!"
+
+# ==============================================================================
+# 9. DEMONSTRATE DATA LEAKAGE NUMERICALLY
+# ==============================================================================
+# Leaked pipeline: fitted on full X (train + test)
+leaked_scaler = StandardScaler()
+leaked_scaler.fit(X[["income"]].fillna(X[["income"]].median()))
+leaked_test_vals = leaked_scaler.transform(X_test[["income"]].fillna(X_train[["income"]].median()))[:5].ravel()
+
+# Correct pipeline: fitted on X_train only
+correct_scaler = StandardScaler()
+correct_scaler.fit(X_train[["income"]].fillna(X_train[["income"]].median()))
+correct_test_vals = correct_scaler.transform(X_test[["income"]].fillna(X_train[["income"]].median()))[:5].ravel()
+
+print("\n--- 9. Data Leakage Demonstration ---")
+print(f"Leaked Scaled (first 5):  {np.round(leaked_test_vals, 4)}")
+print(f"Correct Scaled (first 5): {np.round(correct_test_vals, 4)}")
+print(f"Absolute Difference:      {np.round(np.abs(leaked_test_vals - correct_test_vals), 5)}")
+# Explanation:
+# The leaked version incorporates test set moments into the scaling parameters, giving the model prior knowledge of the evaluation distribution.
+# This artificially compresses errors and produces an over-optimistic evaluation metric that fails to replicate on true production data.
+
+# ==============================================================================
+# 10. TARGET IMBALANCE & SMOTE (TRAIN ONLY)
+# ==============================================================================
+print("\n--- 10. Imbalanced Target Handling ---")
+print("Target ratio before SMOTE:", np.bincount(y_train) / len(y_train))
+print("Class counts before SMOTE:", np.bincount(y_train))
+
+smote = SMOTE(random_state=42)
+X_train_resampled, y_train_resampled = smote.fit_resample(X_train_proc, y_train)
+
+print("Class counts after SMOTE on train:", np.bincount(y_train_resampled))
+print("Test set remains untouched with counts:", np.bincount(y_test))
+# The test set is left untouched to preserve the natural real-world ground-truth distribution and evaluate actual deployment performance.
+
+# ==============================================================================
+# 11. PERSISTENCE & INFERENCE ON NEW DATA
+# ==============================================================================
+joblib.dump(pipeline, "pipeline.joblib")
+loaded_pipeline = joblib.load("pipeline.joblib")
+
+single_record = pd.DataFrame([{
+    "income": 65000.0,
+    "dti_ratio": 22.4,
+    "home_ownership": "MORTGAGE",
+    "credit_grade": "Good",
+    "zip_code": "ZIP_05"
+}])
+
+transformed_record = loaded_pipeline.transform(single_record)
+print("\n--- 11. Loaded Pipeline Transformation ---")
+print("Transformed single test row output:")
+print(transformed_record)
